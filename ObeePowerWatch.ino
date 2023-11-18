@@ -9,9 +9,13 @@ Charles BIJON --- bijon.charles@gmail.com
 #include <lmic.h>
 #include <hal/hal.h>
 #include <SPI.h>
-#include <esp_now.h>
+#include <esp_now.h>  // For ESP-NOW communication
 #include <WiFi.h>
 #include <string.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
+
 
 #define SCK 5    // GPIO5 -- SX1278's SCK
 #define MISO 19  // GPIO19 -- SX1278's MISO
@@ -32,17 +36,29 @@ Charles BIJON --- bijon.charles@gmail.com
 
 const bool ENABLE_SERIAL = true;  // enable serial debug output here if required
 
-const unsigned TX_INTERVAL = 30;  // Schedule TX every this many seconds (might become longer due to duty  cycle limitations).
-const unsigned CONFIRMED_DATA = 0;
+// Wi-Fi credentials OTA UPDATE
+// Hostname for better identification
+const char *HOSTNAME = "ObeePowerWatch";
+const char *ssid = "myphonesharing";   // PLEASE SET IT FIRST
+const char *OTA_PASSWORD = "adminme";  // PLEASE SET IT FIRST : Password for OTA updates
+bool OTAupdate = false;
+const int MAX_WIFI_ATTEMPT = 30;  // Retry to catch the AP at boot
 
+// BOARDS config
 const long LINK_BOARD_TIMEOUT = 20;  //secondes after this timeout the satelite board is considered as down
 const int NUMBER_OF_BOARDS = 7;
 const int LDR_THRESHOLD_NIGHT = 460;
+const int MODE_ON = 2;
+const int MODE_SLEEP = 1;
+const int MODE_OFF = 0;
 
+//Lora COnfig
 const int LORA_DATA_LENGTH = 55;
 const int LORA_HARPE_BYTES_LENGTH = 6;
 const int LORA_DATA_OFFSET = 13;     // start of boards id
 const int ALARM_MAX_DURATION = 200;  // secondes (others are ms)
+const unsigned TX_INTERVAL = 60;     // Schedule TX every this many seconds (might become longer due to duty  cycle limitations).
+const unsigned CONFIRMED_DATA = 0;
 
 // BEEP BEEP
 const int STARTUP_BEEP_DURATION = 80;
@@ -84,6 +100,7 @@ typedef struct WIFI_RX {
   float loadvoltage;
   float power_mW;
   float delta_power_mW;
+  char *mac;
 } WIFI_RX;
 
 WIFI_RX myData;  // data from pingers
@@ -123,6 +140,10 @@ BOARD_STATS boartState[NUMBER_OF_BOARDS] = { state0, state1, state2, state3, sta
 // for lora communication
 static uint8_t mydata[LORA_DATA_LENGTH];
 
+//RemoteDebug Debug; // For remote debugging
+
+AsyncWebServer server(80);
+
 // callback when data is recv from Master
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
   char macStr[18];
@@ -132,7 +153,8 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
   boardsStruct[myData.id].frags = boardsStruct[myData.id].frags + myData.frags;
   boardsStruct[myData.id].power_mW = boardsStruct[myData.id].power_mW + myData.power_mW;
   boardsStruct[myData.id].counted = boardsStruct[myData.id].counted + 1;
-  // printf(" %d frags, %f mW , %d counts \n", boardsStruct[myData.id].frags, boardsStruct[myData.id].power_mW, boardsStruct[myData.id].counted );
+  boardsStruct[myData.id].mac = macStr;
+  //printf("mac address : %s -> %d frags, %f mW , %d counts \n", macStr , boardsStruct[myData.id].frags, boardsStruct[myData.id].power_mW, boardsStruct[myData.id].counted );
 }
 
 void Alimentation() {
@@ -140,6 +162,7 @@ void Alimentation() {
   adc_voltage = ((adc_value * ref_voltage) / 4096.0);
   Serial.printf("Alimentation : %f Volts \n", adc_voltage);
 }
+
 
 // Init ESP Now with fallback
 void InitESPNow() {
@@ -156,12 +179,11 @@ void InitESPNow() {
 }
 
 void configDeviceAP() {
-  const char *SSID = "ObeePowerWatch";
-  bool result = WiFi.softAP(SSID, "powermayabee2023", CHANNEL, 0);
+  bool result = WiFi.softAP(HOSTNAME, OTA_PASSWORD, CHANNEL, 0);
   if (!result) {
     Serial.println("AP Config failed.");
   } else {
-    Serial.println("AP Config Success. Broadcasting with AP: " + String(SSID));
+    Serial.println("AP Config Success. Broadcasting with AP: " + String(HOSTNAME));
   }
 }
 
@@ -385,7 +407,7 @@ void CheckingSateliteBoards(int LDR, bool RainState) {
         boartState[i].counter = millis() / 1000;
         boartState[i].alarm = 1;
         Serial.println(F("is down !"));
-        mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = 1;
+        mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = MODE_SLEEP;
         bipBip(1, BOARD_DOWN_BEEP_DURATION);
       } else {
 
@@ -397,13 +419,13 @@ void CheckingSateliteBoards(int LDR, bool RainState) {
             mydata[(i * 2) + LORA_DATA_OFFSET + 1] = 0;
             bipBip(3, BEEP_SHUTTINGDOWN_INTERVAL);
           } else {
-            mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = 1;
+            mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = MODE_SLEEP;
             Serial.println(F("Alerte ! "));
             bipBip(2, BEEP_ALERT_INTERVAL);
           }
         } else {
           Serial.println(F("Down since a long time"));
-          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = 0;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 1] = MODE_OFF;
         }
       }
       mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET] = 0;
@@ -415,29 +437,25 @@ void CheckingSateliteBoards(int LDR, bool RainState) {
       } else {
         Serial.println(F("is sleeping"));
       }
-      mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET] = 1;
+      mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET] = MODE_SLEEP;
     } else {
       if (boartState[i].isUp != 2 && (millis() / 1000) - boardsStruct[i].counter < LINK_BOARD_TIMEOUT) {
         boartState[i].isUp = 2;
         boartState[i].alarmIsEnable = 1;
         Serial.println(F("is UP !"));
         bipBip(1, BOARD_UP_BEEP_DURATION);
-        mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET] = 2;
+        mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET] = MODE_ON;
       } else {
         if ((millis() / 1000) - boardsStruct[i].counter < LINK_BOARD_TIMEOUT) {
-
           //Hornets counter
           HortnetsKills = HortnetsKills + boardsStruct[i].frags;
-
           //Power monitoring
           float powermW = (boardsStruct[i].power_mW / boardsStruct[i].counted) * 100;
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 2] = (byte)((static_cast<long>(powermW) & 0xFF000000) >> 24);  // Last average harpe power mW x 100
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 3] = (byte)((static_cast<long>(powermW) & 0x00FF0000) >> 16);  //
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 4] = (byte)((static_cast<long>(powermW) & 0x0000FF00) >> 8);   //
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 5] = (byte)((static_cast<long>(powermW) & 0X000000FF));        //
-
-          Serial.printf("Up since a long time : %d frags and %f mW of power \n", boardsStruct[i].frags, powermW / 100);
-
+          Serial.printf("%s is Up since a long time : %d frags and %f mW of power \n", boardsStruct[myData.id].mac, boardsStruct[i].frags, powermW / 100);
           //reseting harpe counters
           boardsStruct[i].power_mW = 0;
           boardsStruct[i].counted = 0;
@@ -495,6 +513,36 @@ void preparePayload() {
   mydata[12] = (byte)((HortnetsKills & 0X000000FF));        //
 }
 
+
+static bool ConnectWifi(const char *_ssid, const char *wifipass) {
+  WiFi.disconnect(true, true);
+  WiFi.begin(_ssid, wifipass);
+  uint8_t wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
+    Serial.print(".");
+    delay(1000);
+    if (wifiAttempts == 10) {
+      WiFi.disconnect(true, true);  //Switch off the wifi on making 10 attempts and start again.
+      WiFi.begin(_ssid, wifipass);
+    }
+    wifiAttempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setAutoReconnect(true);          //Not necessary
+    Serial.println();                     //Not necessary
+    Serial.print("Connected with IP: ");  //Not necessary
+    Serial.println(WiFi.localIP());       //Not necessary
+    return true;
+  } else {
+    WiFi.disconnect(true, true);
+    return false;
+  }
+  if (wifiAttempts > MAX_WIFI_ATTEMPT) {
+    return false;
+  }
+  delay(100);
+}
+
 void setup() {
   Serial.begin(115200);
   // identify MCU device (MAC)
@@ -517,21 +565,37 @@ void setup() {
 
   // Starup test Bip
   bipBip(1, STARTUP_BEEP_DURATION);
-  Serial.printf("%d Boards configured \n", NUMBER_OF_BOARDS);
 
-  WiFi.mode(WIFI_AP);  // configure device AP mode
-  configDeviceAP();    // This is the mac address of the Slave in AP Mode
-  Serial.print("AP MAC: ");
-  Serial.println(WiFi.softAPmacAddress());  // Init ESPNow with a fallback logic
-  InitESPNow();                             // Once ESPNow is successfully Init, we will register for recv CB to get recv packer info.
-  esp_now_register_recv_cb(OnDataRecv);
-  // LMIC init
-  os_init();
-  // Reset the MAC state. Session and pending data transfers will be discarded.
-  LMIC_reset();
-  do_send(&sendjob);
+  if (ConnectWifi(ssid, OTA_PASSWORD)) {
+    Serial.println("OTA mode activated");
+    Serial.println("Ready");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+      request->send(200, "text/plain", "Hi! I am ESP32.");
+    });
+    AsyncElegantOTA.begin(&server);  // Start ElegantOTA
+    server.begin();
+    Serial.println("HTTP server started");
+    OTAupdate = true;
+  } else {
+    Serial.printf("%d Boards configured \n", NUMBER_OF_BOARDS);
+    WiFi.mode(WIFI_AP);  // configure device AP mode
+    configDeviceAP();    // This is the mac address of the Slave in AP Mode
+    Serial.print("AP MAC: ");
+    Serial.println(WiFi.softAPmacAddress());  // Init ESPNow with a fallback logic
+    InitESPNow();                             // Once ESPNow is successfully Init, we will register for recv CB to get recv packer info.
+    esp_now_register_recv_cb(OnDataRecv);
+    // LMIC init
+    os_init();
+    // Reset the MAC state. Session and pending data transfers will be discarded.
+    LMIC_reset();
+    do_send(&sendjob);
+  }
 }
 
 void loop() {
-  os_runloop_once();
+  if (!OTAupdate) {
+    os_runloop_once();
+  }
 }
