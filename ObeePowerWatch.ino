@@ -25,7 +25,7 @@ Charles BIJON --- bijon.charles@gmail.com
 #define DI0 26   // GPIO26 -- SX1278's IRQ(Interrupt Request)
 #define BAND 868E6
 #define CFG_sx1276_radio 1
-#define LMIC_DEBUG_LEVEL 1
+#define LMIC_DEBUG_LEVEL 2
 #define LED_BUILTIN 2
 #define LIGHT_SENSOR_PIN 36  // ESP32 pin GIOP12 (ADC2_5)
 #define RELAY_1_PIN 21
@@ -42,7 +42,7 @@ const char *HOSTNAME = "ObeePowerWatch";
 const char *ssid = "myphonesharing";   // PLEASE SET IT FIRST
 const char *OTA_PASSWORD = "adminme";  // PLEASE SET IT FIRST : Password for OTA updates
 bool OTAupdate = false;
-const int MAX_WIFI_ATTEMPT = 30;  // Retry to catch the AP at boot
+const int MAX_WIFI_ATTEMPT = 10;  // Retry to catch the AP at boot
 
 // BOARDS config
 const long LINK_BOARD_TIMEOUT = 20;  //secondes after this timeout the satelite board is considered as down
@@ -53,8 +53,8 @@ const int MODE_SLEEP = 1;
 const int MODE_OFF = 0;
 
 //Lora COnfig
-const int LORA_DATA_LENGTH = 55;
-const int LORA_HARPE_BYTES_LENGTH = 6;
+const int LORA_DATA_LENGTH = 96;
+const int LORA_HARPE_BYTES_LENGTH = 12;
 const int LORA_DATA_OFFSET = 13;     // start of boards id
 const int ALARM_MAX_DURATION = 200;  // secondes (others are ms)
 const unsigned TX_INTERVAL = 60;     // Schedule TX every this many seconds (might become longer due to duty  cycle limitations).
@@ -100,7 +100,7 @@ typedef struct WIFI_RX {
   float loadvoltage;
   float power_mW;
   float delta_power_mW;
-  char *mac;
+  char mac[18];
 } WIFI_RX;
 
 WIFI_RX myData;  // data from pingers
@@ -153,8 +153,9 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
   boardsStruct[myData.id].frags = boardsStruct[myData.id].frags + myData.frags;
   boardsStruct[myData.id].power_mW = boardsStruct[myData.id].power_mW + myData.power_mW;
   boardsStruct[myData.id].counted = boardsStruct[myData.id].counted + 1;
-  boardsStruct[myData.id].mac = macStr;
-  //printf("mac address : %s -> %d frags, %f mW , %d counts \n", macStr , boardsStruct[myData.id].frags, boardsStruct[myData.id].power_mW, boardsStruct[myData.id].counted );
+  //boardsStruct[myData.id].mac = (char*)malloc(strlen(macStr) + 1);
+  strcpy(boardsStruct[myData.id].mac, macStr);
+  //printf("mac address : %s -> %d frags, %f mW , %d counts \n", boardsStruct[myData.id].mac, boardsStruct[myData.id].frags, boardsStruct[myData.id].power_mW, boardsStruct[myData.id].counted);
 }
 
 void Alimentation() {
@@ -193,14 +194,16 @@ void do_send(osjob_t *j);
 // first. When copying an EUI from ttnctl output, this means to reverse
 // the bytes. For TTN issued EUIs the last bytes should be 0xD5, 0xB3,
 // 0x70.
-static const u1_t PROGMEM APPEUI[8] = { XXXXXXXXXXX };
+static const u1_t PROGMEM APPEUI[8] = { x, x, x, x, x,
+                                        x, x, x };  // PLEASE SET IT FIRST
 
 void os_getArtEui(u1_t *buf) {
   memcpy_P(buf, APPEUI, 8);
 }
 
 // This should also be in little endian format, see above.
-static const u1_t PROGMEM DEVEUI[8] = { XXXXXXXXXXX };
+static const u1_t PROGMEM DEVEUI[8] = { x, x, x, x, x,
+                                        x, x, x };  // PLEASE SET IT FIRST
 
 
 void os_getDevEui(u1_t *buf) {
@@ -210,7 +213,8 @@ void os_getDevEui(u1_t *buf) {
 // This key should be in big endian format (or, since it is not really a
 // number but a block of memory, endianness does not really apply). In
 // practice, a key taken from ttnctl can be copied as-is.
-static const u1_t PROGMEM APPKEY[16] = { XXXXXXXXXXXX };
+static const u1_t PROGMEM APPKEY[16] = { x, x, x, x, x,
+                                         x, x, x, x, x, x, x, x, x, x, x };  // PLEASE SET IT FIRST
 
 
 
@@ -455,7 +459,17 @@ void CheckingSateliteBoards(int LDR, bool RainState) {
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 3] = (byte)((static_cast<long>(powermW) & 0x00FF0000) >> 16);  //
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 4] = (byte)((static_cast<long>(powermW) & 0x0000FF00) >> 8);   //
           mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 5] = (byte)((static_cast<long>(powermW) & 0X000000FF));        //
-          Serial.printf("%s is Up since a long time : %d frags and %f mW of power \n", boardsStruct[myData.id].mac, boardsStruct[i].frags, powermW / 100);
+          //mac address
+          const char *macAddress = boardsStruct[i].mac;
+          int byte1, byte2, byte3, byte4, byte5, byte6;
+          sscanf(macAddress, "%2X:%2X:%2X:%2X:%2X:%2X", &byte1, &byte2, &byte3, &byte4, &byte5, &byte6);
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 0] = byte1;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 1] = byte2;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 2] = byte3;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 3] = byte4;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 4] = byte5;
+          mydata[(i * LORA_HARPE_BYTES_LENGTH) + LORA_DATA_OFFSET + 6 + 5] = byte6;
+          Serial.printf("%s is Up since a long time : %d frags and %f mW of power \n", boardsStruct[i].mac, boardsStruct[i].frags, powermW / 100);
           //reseting harpe counters
           boardsStruct[i].power_mW = 0;
           boardsStruct[i].counted = 0;
